@@ -428,9 +428,17 @@ void fwts_acpi_object_dump(fwts_framework *fw, const ACPI_OBJECT *obj)
 void fwts_acpi_object_evaluate_report_error(
 	fwts_framework *fw,
 	const char *name,
-	const ACPI_STATUS status)
+	const ACPI_STATUS status,
+	const bool pcc_unsupported)
 {
 	int i;
+
+	if (status == AE_SUPPORT && pcc_unsupported) {
+		fwts_skipped(fw, "Cannot evaluate '%s': PCC OperationRegion "
+			"communication is not supported by the FWTS userspace "
+			"ACPICA environment.", name);
+		return;
+	}
 
 	/* Generic cases */
 	for (i = 0; errors[i].error_type; i++) {
@@ -467,7 +475,7 @@ void fwts_acpi_object_evaluate_report_error(
 /*
  *  fwts_acpi_object_evaluate()
  *	evaluate object, return error status (handle this with
- *	fwts_method_evaluate_report_error()).
+ *	fwts_acpi_object_evaluate_report_error()).
  * 	This returns buf which auto allocates any return values
  *	which need to be freed post-evalutation using free().
  */
@@ -476,12 +484,36 @@ ACPI_STATUS fwts_acpi_object_evaluate(fwts_framework *fw,
         ACPI_OBJECT_LIST *arg_list,
 	ACPI_BUFFER	 *buf)
 {
+	return fwts_acpi_object_evaluate_with_pcc(fw, name, arg_list, buf, NULL);
+}
+
+/*
+ *  fwts_acpi_object_evaluate_with_pcc()
+ *	evaluate an object and capture whether it stopped on unsupported PCC
+ *	communication. Consume the handler state even if the caller does not
+ *	request the PCC result, or evaluation returns a different status.
+ */
+ACPI_STATUS fwts_acpi_object_evaluate_with_pcc(fwts_framework *fw,
+	char *name,
+	ACPI_OBJECT_LIST *arg_list,
+	ACPI_BUFFER *buf,
+	bool *pcc_unsupported)
+{
+	ACPI_STATUS status;
+	bool pcc_called;
+
 	FWTS_UNUSED(fw);
 
 	buf->Length  = ACPI_ALLOCATE_BUFFER;
 	buf->Pointer = NULL;
+	fwts_acpi_pcc_handler_called_set(false);
 
-	return AcpiEvaluateObject(NULL, name, arg_list, buf);
+	status = AcpiEvaluateObject(NULL, name, arg_list, buf);
+	pcc_called = fwts_acpi_pcc_handler_called_get_and_clear();
+	if (pcc_unsupported != NULL)
+		*pcc_unsupported = status == AE_SUPPORT && pcc_called;
+
+	return status;
 }
 
 int fwts_method_check_type__(
@@ -1160,21 +1192,33 @@ void fwts_evaluate_found_method(
 	ACPI_STATUS	status;
 	int sem_acquired;
 	int sem_released;
+	bool pcc_called;
+	bool pcc_unsupported;
 
 	fwts_acpica_sem_count_clear();
 
 	buf.Length  = ACPI_ALLOCATE_BUFFER;
 	buf.Pointer = NULL;
+	fwts_acpi_pcc_handler_called_set(false);
 	status = AcpiEvaluateObject(*parent, name, arg_list, &buf);
+	pcc_called = fwts_acpi_pcc_handler_called_get_and_clear();
+	pcc_unsupported = status == AE_SUPPORT && pcc_called;
 
-	if (ACPI_SUCCESS(status) && check_func != NULL) {
+	if (pcc_unsupported) {
+		fwts_acpi_object_evaluate_report_error(fw, name, status, pcc_unsupported);
+	} else if (ACPI_SUCCESS(status) && check_func != NULL) {
 		ACPI_OBJECT *obj = buf.Pointer;
 		check_func(fw, name, &buf, obj, private);
 	}
 	free(buf.Pointer);
 
 	fwts_acpica_sem_count_get(&sem_acquired, &sem_released);
-	if (sem_acquired != sem_released) {
+	/* Aborting an unsupported PCC transaction can prevent AML lock releases. */
+	if (pcc_unsupported && sem_acquired != sem_released) {
+		fwts_log_info(fw, "%s left %d locks in an acquired state; "
+			"lock accounting was incomplete because PCC evaluation "
+			"was aborted as unsupported.", name, sem_acquired - sem_released);
+	} else if (sem_acquired != sem_released) {
 		fwts_failed(fw, LOG_LEVEL_MEDIUM, "AMLLocksAcquired",
 			"%s left %d locks in an acquired state.",
 			name, sem_acquired - sem_released);

@@ -354,13 +354,15 @@ void method_evaluate_found_method(
 	ACPI_STATUS	  ret;
 	int sem_acquired;
 	int sem_released;
+	bool pcc_unsupported;
 
 	fwts_acpica_sem_count_clear();
 
-	ret = fwts_acpi_object_evaluate(fw, name, arg_list, &buf);
+	ret = fwts_acpi_object_evaluate_with_pcc(fw, name, arg_list, &buf,
+		&pcc_unsupported);
 
 	if (ACPI_FAILURE(ret) != AE_OK) {
-		fwts_acpi_object_evaluate_report_error(fw, name, ret);
+		fwts_acpi_object_evaluate_report_error(fw, name, ret, pcc_unsupported);
 	} else {
 		if (check_func != NULL) {
 			ACPI_OBJECT *obj = buf.Pointer;
@@ -370,7 +372,12 @@ void method_evaluate_found_method(
 	free(buf.Pointer);
 
 	fwts_acpica_sem_count_get(&sem_acquired, &sem_released);
-	if (sem_acquired != sem_released) {
+	/* Aborting an unsupported PCC transaction can prevent AML lock releases. */
+	if (pcc_unsupported && sem_acquired != sem_released) {
+		fwts_log_info(fw, "%s left %d locks in an acquired state; "
+			"lock accounting was incomplete because PCC evaluation "
+			"was aborted as unsupported.", name, sem_acquired - sem_released);
+	} else if (sem_acquired != sem_released) {
 		fwts_failed(fw, LOG_LEVEL_MEDIUM, "AMLLocksAcquired",
 			"%s left %d locks in an acquired state.",
 			name, sem_acquired - sem_released);
